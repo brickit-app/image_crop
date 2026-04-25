@@ -2,6 +2,26 @@
 
 #import <Photos/Photos.h>
 #import <MobileCoreServices/MobileCoreServices.h>
+#import <ImageIO/ImageIO.h>
+#import <math.h>
+
+/// Pixel size after applying EXIF orientation (matches thumbnail with kCGImageSourceCreateThumbnailWithTransform).
+static CGSize ImageCropOrientedPixelSize(CFDictionaryRef properties) {
+    if (properties == NULL) {
+        return CGSizeZero;
+    }
+    NSNumber *w = (__bridge NSNumber *)CFDictionaryGetValue(properties, kCGImagePropertyPixelWidth);
+    NSNumber *h = (__bridge NSNumber *)CFDictionaryGetValue(properties, kCGImagePropertyPixelHeight);
+    double dw = w ? w.doubleValue : 0;
+    double dh = h ? h.doubleValue : 0;
+    NSNumber *orientNum = (__bridge NSNumber *)CFDictionaryGetValue(properties, kCGImagePropertyOrientation);
+    NSInteger orient = orientNum ? orientNum.integerValue : 1;
+    // EXIF 5–8 swap width/height for upright display dimensions.
+    if (orient >= 5 && orient <= 8) {
+        return CGSizeMake(dh, dw);
+    }
+    return CGSizeMake(dw, dh);
+}
 
 @implementation ImageCropPlugin
 
@@ -49,8 +69,8 @@
            result:(FlutterResult)result {
     [self execute:^{
         NSURL* url = [NSURL fileURLWithPath:path];
-        CGImageSourceRef imageSource = CGImageSourceCreateWithURL((CFURLRef) url, NULL);
-        
+        CGImageSourceRef imageSource = CGImageSourceCreateWithURL((CFURLRef)url, NULL);
+
         if (imageSource == NULL) {
             result([FlutterError errorWithCode:@"INVALID"
                                        message:@"Image source cannot be opened"
@@ -58,13 +78,27 @@
             return;
         }
 
-        CFDictionaryRef options = (__bridge CFDictionaryRef) @{
-                                                               (id) kCGImageSourceCreateThumbnailWithTransform: @YES,
-                                                               (id) kCGImageSourceCreateThumbnailFromImageAlways: @YES
-                                                               };
+        CFDictionaryRef properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, NULL);
+        CGSize oriented = ImageCropOrientedPixelSize(properties);
+        if (properties) {
+            CFRelease(properties);
+        }
 
-        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, options);
-        
+        NSMutableDictionary* options = [NSMutableDictionary dictionaryWithDictionary:@{
+            (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
+            (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
+        }];
+
+        if (oriented.width >= 1.0 && oriented.height >= 1.0) {
+            double lw = oriented.width;
+            double lh = oriented.height;
+            double targetW = lw * (double)area.size.width * scale.doubleValue;
+            double targetH = lh * (double)area.size.height * scale.doubleValue;
+            double maxPixel = MAX(MAX(targetW, targetH), 1.0);
+            options[(id)kCGImageSourceThumbnailMaxPixelSize] = @(maxPixel);
+        }
+
+        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, (__bridge CFDictionaryRef)options);
 
         if (image == NULL) {
             result([FlutterError errorWithCode:@"INVALID"
@@ -73,34 +107,59 @@
             CFRelease(imageSource);
             return;
         }
-        
+
         size_t width = CGImageGetWidth(image);
         size_t height = CGImageGetHeight(image);
-        size_t scaledWidth = (size_t) (width * area.size.width * scale.floatValue);
-        size_t scaledHeight = (size_t) (height * area.size.height * scale.floatValue);
-        size_t bitsPerComponent = CGImageGetBitsPerComponent(image);
-        size_t bytesPerRow = CGImageGetBytesPerRow(image) / width * scaledWidth;
-        CGImageAlphaInfo bitmapInfo = CGImageGetAlphaInfo(image);
-        CGColorSpaceRef colorspace = CGImageGetColorSpace(image);
-        
-        CGImageRef croppedImage = CGImageCreateWithImageInRect(image,
-                                                               CGRectMake(width * area.origin.x,
-                                                                          height * area.origin.y,
-                                                                          width * area.size.width,
-                                                                          height * area.size.height));
-        
+        size_t scaledWidth = (size_t)MAX(1, lround(width * (double)area.size.width * scale.doubleValue));
+        size_t scaledHeight = (size_t)MAX(1, lround(height * (double)area.size.height * scale.doubleValue));
+
+        CGRect cropRect = CGRectMake((CGFloat)width * area.origin.x,
+                                     (CGFloat)height * area.origin.y,
+                                     (CGFloat)width * area.size.width,
+                                     (CGFloat)height * area.size.height);
+        cropRect = CGRectIntersection(cropRect, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
+        if (CGRectIsEmpty(cropRect) || cropRect.size.width < 1 || cropRect.size.height < 1) {
+            CFRelease(image);
+            CFRelease(imageSource);
+            result([FlutterError errorWithCode:@"INVALID"
+                                       message:@"Invalid crop region"
+                                       details:nil]);
+            return;
+        }
+
+        CGImageRef croppedImage = CGImageCreateWithImageInRect(image, cropRect);
         CFRelease(image);
         CFRelease(imageSource);
-        
-        if (scale.floatValue != 1.0) {
+
+        if (croppedImage == NULL) {
+            result([FlutterError errorWithCode:@"INVALID"
+                                       message:@"Image cannot be cropped"
+                                       details:nil]);
+            return;
+        }
+
+        if (fabs(scale.doubleValue - 1.0) > 1e-6) {
+            size_t bitsPerComponent = CGImageGetBitsPerComponent(croppedImage);
+            CGImageAlphaInfo bitmapInfo = CGImageGetAlphaInfo(croppedImage);
+            CGColorSpaceRef colorspace = CGImageGetColorSpace(croppedImage);
+            BOOL createdColorSpace = NO;
+            if (colorspace == NULL) {
+                colorspace = CGColorSpaceCreateDeviceRGB();
+                createdColorSpace = YES;
+            }
+
             CGContextRef context = CGBitmapContextCreate(NULL,
-                                                         scaledWidth,
-                                                         scaledHeight,
-                                                         bitsPerComponent,
-                                                         bytesPerRow,
-                                                         colorspace,
-                                                         bitmapInfo);
-            
+                                                          scaledWidth,
+                                                          scaledHeight,
+                                                          bitsPerComponent,
+                                                          0,
+                                                          colorspace,
+                                                          bitmapInfo);
+
+            if (createdColorSpace) {
+                CGColorSpaceRelease(colorspace);
+            }
+
             if (context == NULL) {
                 result([FlutterError errorWithCode:@"INVALID"
                                            message:@"Image cannot be scaled"
@@ -108,22 +167,28 @@
                 CFRelease(croppedImage);
                 return;
             }
-            
-            CGRect rect = CGContextGetClipBoundingBox(context);
-            CGContextDrawImage(context, rect, croppedImage);
-            
+
+            CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+            CGRect dstRect = CGRectMake(0, 0, (CGFloat)scaledWidth, (CGFloat)scaledHeight);
+            CGContextDrawImage(context, dstRect, croppedImage);
+
             CGImageRef scaledImage = CGBitmapContextCreateImage(context);
-            
             CGContextRelease(context);
             CFRelease(croppedImage);
-            
             croppedImage = scaledImage;
+
+            if (croppedImage == NULL) {
+                result([FlutterError errorWithCode:@"INVALID"
+                                           message:@"Image cannot be scaled"
+                                           details:nil]);
+                return;
+            }
         }
-        
+
         NSURL* croppedUrl = [self createTemporaryImageUrl];
         bool saved = [self saveImage:croppedImage url:croppedUrl];
         CFRelease(croppedImage);
-        
+
         if (saved) {
             result(croppedUrl.path);
         } else {
@@ -229,22 +294,23 @@
 
 - (void)requestPermissionsWithResult:(FlutterResult)result {
     [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
-        if (status == PHAuthorizationStatusAuthorized) {
-            result(@YES);
-        } else {
-            result(@NO);
+        BOOL granted = (status == PHAuthorizationStatusAuthorized);
+        if (@available(iOS 14, *)) {
+            granted = granted || (status == PHAuthorizationStatusLimited);
         }
+        result(@(granted));
     }];
 }
 
 - (bool)saveImage:(CGImageRef)image url:(NSURL*)url {
     CGImageDestinationRef destination = CGImageDestinationCreateWithURL((CFURLRef) url, kUTTypeJPEG, 1, NULL);
+    if (destination == NULL) {
+        return false;
+    }
     CGImageDestinationAddImage(destination, image, NULL);
-    
-    bool finilized = CGImageDestinationFinalize(destination);
+    bool finalized = CGImageDestinationFinalize(destination);
     CFRelease(destination);
-    
-    return finilized;
+    return finalized;
 }
 
 - (NSURL*)createTemporaryImageUrl {

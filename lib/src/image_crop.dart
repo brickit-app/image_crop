@@ -21,35 +21,49 @@ class ImageOptions {
 }
 
 class ImageCrop {
-  static const _channel = const MethodChannel('plugins.lykhonis.com/image_crop');
+  static const MethodChannel _channel = MethodChannel('plugins.lykhonis.com/image_crop');
 
-  static Future<bool> requestPermissions() =>
-      _channel.invokeMethod('requestPermissions').then<bool>((result) => result);
+  static Future<bool> requestPermissions() async {
+    final Object? result = await _channel.invokeMethod<Object?>('requestPermissions');
+    if (result is bool) {
+      return result;
+    }
+    throw StateError('Unexpected requestPermissions result: $result');
+  }
 
   static Future<ImageOptions> getImageOptions({
     required File file,
   }) async {
-    final result = await _channel.invokeMethod('getImageOptions', {'path': file.path});
-
-    return ImageOptions(
-      width: result['width'],
-      height: result['height'],
-    );
+    final Object? raw = await _channel.invokeMethod<Object?>('getImageOptions', {'path': file.path});
+    if (raw is! Map) {
+      throw StateError('Unexpected getImageOptions result: $raw');
+    }
+    final width = raw['width'];
+    final height = raw['height'];
+    if (width is! num || height is! num) {
+      throw StateError('Invalid getImageOptions dimensions: $raw');
+    }
+    return ImageOptions(width: width.toInt(), height: height.toInt());
   }
 
   static Future<File> cropImage({
     required File file,
     required Rect area,
     double? scale,
-  }) =>
-      _channel.invokeMethod('cropImage', {
-        'path': file.path,
-        'left': area.left,
-        'top': area.top,
-        'right': area.right,
-        'bottom': area.bottom,
-        'scale': scale ?? 1.0,
-      }).then<File>((result) => File(result));
+  }) async {
+    final Object? path = await _channel.invokeMethod<Object?>('cropImage', {
+      'path': file.path,
+      'left': area.left,
+      'top': area.top,
+      'right': area.right,
+      'bottom': area.bottom,
+      'scale': scale ?? 1.0,
+    });
+    if (path is! String) {
+      throw StateError('Unexpected cropImage result: $path');
+    }
+    return File(path);
+  }
 
   static Future<File> sampleImage({
     required File file,
@@ -57,20 +71,20 @@ class ImageCrop {
     int? preferredWidth,
     int? preferredHeight,
   }) async {
-    assert(() {
-      if (preferredSize == null && (preferredWidth == null || preferredHeight == null)) {
-        throw ArgumentError(
-            'Preferred size or both width and height of a resampled image must be specified.');
-      }
-      return true;
-    }());
+    if (preferredSize == null && (preferredWidth == null || preferredHeight == null)) {
+      throw ArgumentError(
+        'Preferred size or both width and height of a resampled image must be specified.',
+      );
+    }
 
-    final String path = await _channel.invokeMethod('sampleImage', {
+    final Object? path = await _channel.invokeMethod<Object?>('sampleImage', {
       'path': file.path,
       'maximumWidth': preferredSize ?? preferredWidth,
       'maximumHeight': preferredSize ?? preferredHeight,
     });
-
+    if (path is! String) {
+      throw StateError('Unexpected sampleImage result: $path');
+    }
     return File(path);
   }
 }

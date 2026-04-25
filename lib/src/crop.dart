@@ -287,9 +287,9 @@ class CropState extends State<Crop> with TickerProviderStateMixin  {
                 viewWidth;
       }
     }
-    final aspectRatio = _maxAreaWidthMap[widget.aspectRatio];
-    if (aspectRatio != null) {
-      _maxAreaWidthMap[aspectRatio] = width;
+    final double? ar = widget.aspectRatio;
+    if (ar != null) {
+      _maxAreaWidthMap[ar] = width;
     }
 
     return Rect.fromLTWH((1.0 - width) / 2, (1.0 - height) / 2, width, height);
@@ -762,7 +762,7 @@ class _CropPainter extends CustomPainter {
 
     final paint = Paint()
       ..isAntiAlias = false
-      ..color = _kCropGridColor.withOpacity(_kCropGridColor.opacity * active)
+      ..color = _kCropGridColor.withValues(alpha: _kCropGridColor.a * active)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
 

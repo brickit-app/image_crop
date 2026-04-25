@@ -1,12 +1,17 @@
 package com.lykhonis.imagecrop;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.pm.PackageManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.BitmapRegionDecoder;
 import android.graphics.Canvas;
 import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.PointF;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.os.Build;
@@ -38,7 +43,6 @@ import io.flutter.embedding.engine.plugins.activity.ActivityAware;
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
 
 import static android.Manifest.permission.READ_EXTERNAL_STORAGE;
-import static android.Manifest.permission.WRITE_EXTERNAL_STORAGE;
 
 public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, MethodCallHandler, PluginRegistry.RequestPermissionsResultListener {
     private static final int PERMISSION_REQUEST_CODE = 13094;
@@ -47,24 +51,30 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
 
     private ActivityPluginBinding binding;
     private Activity activity;
+    private Context applicationContext;
     private Result permissionRequestResult;
     private ExecutorService executor;
 
-    private ImageCropPlugin(Activity activity) {
-        this.activity = activity;
-    }
-
-    public ImageCropPlugin(){ }
+    public ImageCropPlugin() {}
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-      this.setup(binding.getBinaryMessenger());
+        applicationContext = binding.getApplicationContext();
+        this.setup(binding.getBinaryMessenger());
     }
   
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-        channel.setMethodCallHandler(null);
-        channel = null;
+        if (channel != null) {
+            channel.setMethodCallHandler(null);
+            channel = null;
+        }
+        synchronized (this) {
+            if (executor != null) {
+                executor.shutdown();
+                executor = null;
+            }
+        }
     }
 
     @Override
@@ -133,7 +143,12 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
     }
 
     private void ui(@NonNull Runnable runnable) {
-        activity.runOnUiThread(runnable);
+        Activity a = activity;
+        if (a != null) {
+            a.runOnUiThread(runnable);
+        } else {
+            new Handler(Looper.getMainLooper()).post(runnable);
+        }
     }
 
     private void cropImage(final String path, final RectF area, final float scale, final Result result) {
@@ -151,59 +166,71 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
                     return;
                 }
 
-                Bitmap srcBitmap = BitmapFactory.decodeFile(path, null);
-                if (srcBitmap == null) {
-                    ui(new Runnable() {
-                        @Override
-                        public void run() {
-                            result.error("INVALID", "Image source cannot be decoded", null);
-                        }
-                    });
+                ImageOptions options = decodeImageOptions(path);
+                int deg = ((options.getDegrees() % 360) + 360) % 360;
+                if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
+                    cropImageLegacyFullDecode(path, area, scale, result, options);
                     return;
                 }
 
-                ImageOptions options = decodeImageOptions(path);
-                if (options.isFlippedDimensions()) {
-                    Matrix transformations = new Matrix();
-                    transformations.postRotate(options.getDegrees());
-                    Bitmap oldBitmap = srcBitmap;
-                    srcBitmap = Bitmap.createBitmap(oldBitmap,
-                                                    0, 0,
-                                                    oldBitmap.getWidth(), oldBitmap.getHeight(),
-                                                    transformations, true);
-                    oldBitmap.recycle();
-                }
-
-                int width = (int) (options.getWidth() * area.width() * scale);
-                int height = (int) (options.getHeight() * area.height() * scale);
-
-                Bitmap dstBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-                Canvas canvas = new Canvas(dstBitmap);
-
-                Paint paint = new Paint();
-                paint.setAntiAlias(true);
-                paint.setFilterBitmap(true);
-                paint.setDither(true);
-
-                Rect srcRect = new Rect((int) (srcBitmap.getWidth() * area.left),
-                                        (int) (srcBitmap.getHeight() * area.top),
-                                        (int) (srcBitmap.getWidth() * area.right),
-                                        (int) (srcBitmap.getHeight() * area.bottom));
-                Rect dstRect = new Rect(0, 0, width, height);
-                canvas.drawBitmap(srcBitmap, srcRect, dstRect, paint);
-
-                // TODO: Research a way to optimize rendering via matrix to reduce memory print.
-//                Matrix transformations = new Matrix();
-//                transformations.mapRect(new RectF(0, 0,
-//                                                  options.getWidth(), options.getHeight()));
-//                transformations.postTranslate(-options.getWidth() / 2f * area.left,
-//                                              -options.getHeight() / 2f * area.top);
-//                transformations.postRotate(options.getDegrees(),
-//                                           options.getWidth() / 2f * area.width(),
-//                                           options.getHeight() / 2f * area.height());
-//                canvas.drawBitmap(srcBitmap, transformations, paint);
-
+                BitmapRegionDecoder decoder = null;
+                Bitmap partial = null;
+                Bitmap dstBitmap = null;
+                Canvas canvas = null;
                 try {
+                    decoder = BitmapRegionDecoder.newInstance(path, false);
+                    if (decoder == null) {
+                        cropImageLegacyFullDecode(path, area, scale, result, options);
+                        return;
+                    }
+
+                    int sw = decoder.getWidth();
+                    int sh = decoder.getHeight();
+                    int lw = options.getWidth();
+                    int lh = options.getHeight();
+
+                    int li = (int) (lw * area.left);
+                    int ti = (int) (lh * area.top);
+                    int ri = (int) (lw * area.right);
+                    int bi = (int) (lh * area.bottom);
+                    li = clamp(li, 0, Math.max(0, lw - 1));
+                    ti = clamp(ti, 0, Math.max(0, lh - 1));
+                    ri = clamp(ri, li + 1, lw);
+                    bi = clamp(bi, ti + 1, lh);
+
+                    int outW = Math.max(1, (int) (lw * area.width() * scale));
+                    int outH = Math.max(1, (int) (lh * area.height() * scale));
+
+                    Rect storageRegion = logicalCropToStorageRegion(li, ti, ri, bi, deg, sw, sh);
+                    if (storageRegion.width() <= 0 || storageRegion.height() <= 0) {
+                        cropImageLegacyFullDecode(path, area, scale, result, options);
+                        return;
+                    }
+
+                    BitmapFactory.Options decodeOpts = new BitmapFactory.Options();
+                    decodeOpts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                    decodeOpts.inSampleSize = calculateInSampleSize(
+                            storageRegion.width(),
+                            storageRegion.height(),
+                            outW,
+                            outH);
+
+                    partial = decoder.decodeRegion(storageRegion, decodeOpts);
+                    if (partial == null) {
+                        cropImageLegacyFullDecode(path, area, scale, result, options);
+                        return;
+                    }
+
+                    dstBitmap = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888);
+                    canvas = new Canvas(dstBitmap);
+                    Paint paint = new Paint();
+                    paint.setAntiAlias(true);
+                    paint.setFilterBitmap(true);
+                    paint.setDither(true);
+
+                    int ins = decodeOpts.inSampleSize;
+                    drawCroppedRegion(partial, storageRegion, ins, deg, sw, sh, li, ti, ri, bi, outW, outH, canvas, paint);
+
                     final File dstFile = createTemporaryImageFile();
                     compressBitmap(dstBitmap, dstFile);
                     ui(new Runnable() {
@@ -212,20 +239,213 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
                             result.success(dstFile.getAbsolutePath());
                         }
                     });
-                } catch (final IOException e) {
+                } catch (IOException e) {
                     ui(new Runnable() {
                         @Override
                         public void run() {
                             result.error("INVALID", "Image could not be saved", e);
                         }
                     });
+                } catch (IllegalArgumentException e) {
+                    Log.w("ImageCrop", "Region decode failed, falling back", e);
+                    cropImageLegacyFullDecode(path, area, scale, result, options);
+                    return;
                 } finally {
-                    canvas.setBitmap(null);
-                    dstBitmap.recycle();
-                    srcBitmap.recycle();
+                    if (canvas != null) {
+                        canvas.setBitmap(null);
+                    }
+                    if (partial != null) {
+                        partial.recycle();
+                    }
+                    if (dstBitmap != null) {
+                        dstBitmap.recycle();
+                    }
+                    if (decoder != null) {
+                        decoder.recycle();
+                    }
                 }
             }
         });
+    }
+
+    /**
+     * Maps logical upright crop [li,ri) x [ti,bi) to a storage-space rectangle (half-open right/bottom
+     * for {@link BitmapRegionDecoder#decodeRegion}) matching EXIF rotation used by {@link ImageOptions}.
+     */
+    private static Rect logicalCropToStorageRegion(int li, int ti, int ri, int bi, int deg, int sw, int sh) {
+        PointF p = new PointF();
+        float minX = Float.POSITIVE_INFINITY;
+        float maxX = Float.NEGATIVE_INFINITY;
+        float minY = Float.POSITIVE_INFINITY;
+        float maxY = Float.NEGATIVE_INFINITY;
+        float[][] corners = {
+                {li, ti}, {ri, ti},
+                {ri, bi}, {li, bi},
+        };
+        for (float[] c : corners) {
+            logicalPointToStorage(c[0], c[1], deg, sw, sh, p);
+            minX = Math.min(minX, p.x);
+            maxX = Math.max(maxX, p.x);
+            minY = Math.min(minY, p.y);
+            maxY = Math.max(maxY, p.y);
+        }
+        int left = clamp((int) Math.floor(minX), 0, sw - 1);
+        int top = clamp((int) Math.floor(minY), 0, sh - 1);
+        int right = clamp((int) Math.ceil(maxX), left + 1, sw);
+        int bottom = clamp((int) Math.ceil(maxY), top + 1, sh);
+        return new Rect(left, top, right, bottom);
+    }
+
+    /**
+     * Maps upright logical pixel (xL, yL) to storage (file) pixel coordinates.
+     * Aligns with {@code Bitmap.createBitmap} + {@code Matrix.postRotate(degrees)} used in the legacy path
+     * for standard EXIF rotations (0, 90, 180, 270).
+     */
+    private static void logicalPointToStorage(float xL, float yL, int deg, int sw, int sh, PointF out) {
+        switch (deg) {
+            case 0:
+                out.set(xL, yL);
+                break;
+            case 90:
+                out.set(sw - 1f - yL, xL);
+                break;
+            case 180:
+                out.set(sw - 1f - xL, sh - 1f - yL);
+                break;
+            case 270:
+                out.set(sh - 1f - yL, xL);
+                break;
+            default:
+                out.set(xL, yL);
+                break;
+        }
+    }
+
+    private static void drawCroppedRegion(
+            Bitmap partial,
+            Rect storageRegion,
+            int inSampleSize,
+            int deg,
+            int sw,
+            int sh,
+            int li,
+            int ti,
+            int ri,
+            int bi,
+            int outW,
+            int outH,
+            Canvas canvas,
+            Paint paint) {
+        int pw = partial.getWidth();
+        int ph = partial.getHeight();
+        if (deg == 0) {
+            Rect src = new Rect(0, 0, pw, ph);
+            Rect dst = new Rect(0, 0, outW, outH);
+            canvas.drawBitmap(partial, src, dst, paint);
+            return;
+        }
+
+        float ins = Math.max(1, inSampleSize);
+        float sl = storageRegion.left;
+        float st = storageRegion.top;
+
+        PointF s = new PointF();
+        float[] srcPts = new float[6];
+        float[] dstPts = new float[6];
+        int k = 0;
+        float[][] logicalCorners = {
+                {li, ti}, {ri, ti}, {ri, bi},
+        };
+        float[][] dstCornerPts = {
+                {0, 0}, {outW, 0}, {outW, outH},
+        };
+        for (int i = 0; i < 3; i++) {
+            logicalPointToStorage(logicalCorners[i][0], logicalCorners[i][1], deg, sw, sh, s);
+            srcPts[k] = (s.x - sl) / ins;
+            srcPts[k + 1] = (s.y - st) / ins;
+            dstPts[k] = dstCornerPts[i][0];
+            dstPts[k + 1] = dstCornerPts[i][1];
+            k += 2;
+        }
+
+        Matrix m = new Matrix();
+        if (!m.setPolyToPoly(srcPts, 0, dstPts, 0, 3)) {
+            throw new IllegalArgumentException("setPolyToPoly failed");
+        }
+        canvas.drawBitmap(partial, m, paint);
+    }
+
+    private static int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
+    }
+
+    /** Full-image decode path for unsupported formats or when region decode fails. */
+    private void cropImageLegacyFullDecode(
+            final String path,
+            final RectF area,
+            final float scale,
+            final Result result,
+            final ImageOptions options) {
+        Bitmap srcBitmap = BitmapFactory.decodeFile(path, null);
+        if (srcBitmap == null) {
+            ui(new Runnable() {
+                @Override
+                public void run() {
+                    result.error("INVALID", "Image source cannot be decoded", null);
+                }
+            });
+            return;
+        }
+        try {
+            if (options.isFlippedDimensions()) {
+                Matrix transformations = new Matrix();
+                transformations.postRotate(options.getDegrees());
+                Bitmap oldBitmap = srcBitmap;
+                srcBitmap = Bitmap.createBitmap(oldBitmap,
+                        0, 0,
+                        oldBitmap.getWidth(), oldBitmap.getHeight(),
+                        transformations, true);
+                oldBitmap.recycle();
+            }
+
+            int width = Math.max(1, (int) (options.getWidth() * area.width() * scale));
+            int height = Math.max(1, (int) (options.getHeight() * area.height() * scale));
+
+            Bitmap dstBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(dstBitmap);
+
+            Paint paint = new Paint();
+            paint.setAntiAlias(true);
+            paint.setFilterBitmap(true);
+            paint.setDither(true);
+
+            Rect srcRect = new Rect((int) (srcBitmap.getWidth() * area.left),
+                    (int) (srcBitmap.getHeight() * area.top),
+                    (int) (srcBitmap.getWidth() * area.right),
+                    (int) (srcBitmap.getHeight() * area.bottom));
+            Rect dstRect = new Rect(0, 0, width, height);
+            canvas.drawBitmap(srcBitmap, srcRect, dstRect, paint);
+
+            final File dstFile = createTemporaryImageFile();
+            compressBitmap(dstBitmap, dstFile);
+            ui(new Runnable() {
+                @Override
+                public void run() {
+                    result.success(dstFile.getAbsolutePath());
+                }
+            });
+            canvas.setBitmap(null);
+            dstBitmap.recycle();
+        } catch (final IOException e) {
+            ui(new Runnable() {
+                @Override
+                public void run() {
+                    result.error("INVALID", "Image could not be saved", e);
+                }
+            });
+        } finally {
+            srcBitmap.recycle();
+        }
     }
 
     private void sampleImage(final String path, final int maximumWidth, final int maximumHeight, final Result result) {
@@ -259,10 +479,16 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
                     return;
                 }
 
-                if (options.getWidth() > maximumWidth && options.getHeight() > maximumHeight) {
-                    float ratio = Math.max(maximumWidth / (float) options.getWidth(), maximumHeight / (float) options.getHeight());
+                if (bitmap.getWidth() > maximumWidth || bitmap.getHeight() > maximumHeight) {
+                    float rw = maximumWidth / (float) bitmap.getWidth();
+                    float rh = maximumHeight / (float) bitmap.getHeight();
+                    float ratio = Math.min(rw, rh);
                     Bitmap sample = bitmap;
-                    bitmap = Bitmap.createScaledBitmap(sample, Math.round(bitmap.getWidth() * ratio), Math.round(bitmap.getHeight() * ratio), true);
+                    bitmap = Bitmap.createScaledBitmap(
+                            sample,
+                            Math.max(1, Math.round(bitmap.getWidth() * ratio)),
+                            Math.max(1, Math.round(bitmap.getHeight() * ratio)),
+                            true);
                     sample.recycle();
                 }
 
@@ -327,7 +553,12 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
             public void run() {
                 File file = new File(path);
                 if (!file.exists()) {
-                    result.error("INVALID", "Image source cannot be opened", null);
+                    ui(new Runnable() {
+                        @Override
+                        public void run() {
+                            result.error("INVALID", "Image source cannot be opened", null);
+                        }
+                    });
                     return;
                 }
 
@@ -347,13 +578,23 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
     }
 
     private void requestPermissions(Result result) {
+        Activity a = activity;
+        if (a == null) {
+            result.error("NO_ACTIVITY", "Cannot request permissions without an activity", null);
+            return;
+        }
+        // Plugin only reads paths provided by the app and writes to app-private cache (no broad storage write).
+        // API 33+: legacy READ_EXTERNAL_STORAGE does not apply; photo access uses picker / Photo APIs.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            result.success(true);
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (activity.checkSelfPermission(READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
-                    activity.checkSelfPermission(WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
+            if (a.checkSelfPermission(READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
                 result.success(true);
             } else {
                 permissionRequestResult = result;
-                activity.requestPermissions(new String[]{READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE}, PERMISSION_REQUEST_CODE);
+                a.requestPermissions(new String[]{READ_EXTERNAL_STORAGE}, PERMISSION_REQUEST_CODE);
             }
         } else {
             result.success(true);
@@ -364,16 +605,18 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
     public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         if (requestCode == PERMISSION_REQUEST_CODE && permissionRequestResult != null) {
             int readExternalStorage = getPermissionGrantResult(READ_EXTERNAL_STORAGE, permissions, grantResults);
-            int writeExternalStorage = getPermissionGrantResult(WRITE_EXTERNAL_STORAGE, permissions, grantResults);
-            permissionRequestResult.success(readExternalStorage == PackageManager.PERMISSION_GRANTED &&
-                                                    writeExternalStorage == PackageManager.PERMISSION_GRANTED);
+            permissionRequestResult.success(readExternalStorage == PackageManager.PERMISSION_GRANTED);
             permissionRequestResult = null;
         }
         return false;
     }
 
     private int getPermissionGrantResult(String permission, String[] permissions, int[] grantResults) {
-        for (int i = 0; i < permission.length(); i++) {
+        if (permissions == null || grantResults == null) {
+            return PackageManager.PERMISSION_DENIED;
+        }
+        int n = Math.min(permissions.length, grantResults.length);
+        for (int i = 0; i < n; i++) {
             if (permission.equals(permissions[i])) {
                 return grantResults[i];
             }
@@ -382,7 +625,11 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
     }
 
     private File createTemporaryImageFile() throws IOException {
-        File directory = activity.getCacheDir();
+        Context ctx = activity != null ? activity : applicationContext;
+        if (ctx == null) {
+            throw new IOException("No context available for temporary file");
+        }
+        File directory = ctx.getCacheDir();
         String name = "image_crop_" + UUID.randomUUID().toString();
         return File.createTempFile(name, ".jpg", directory);
     }

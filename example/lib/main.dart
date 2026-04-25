@@ -16,12 +16,14 @@ void main() {
     ),
   );
 
-  runApp(new MyApp());
+  runApp(const MyApp());
 }
 
 class MyApp extends StatefulWidget {
+  const MyApp({super.key});
+
   @override
-  _MyAppState createState() => new _MyAppState();
+  State<MyApp> createState() => _MyAppState();
 }
 
 class _MyAppState extends State<MyApp> {
@@ -93,11 +95,19 @@ class _MyAppState extends State<MyApp> {
 
   Future<void> _openImage() async {
     final pickedFile = await ImagePicker().pickImage(source: ImageSource.gallery);
+    if (!mounted) {
+      return;
+    }
+    final preferredSide = MediaQuery.sizeOf(context).longestSide.ceil();
     final file = File(pickedFile?.path ?? '');
     final sample = await ImageCrop.sampleImage(
       file: file,
-      preferredSize: context.size?.longestSide.ceil(),
+      preferredSize: preferredSide,
     );
+    if (!mounted) {
+      sample.delete();
+      return;
+    }
 
     _sample?.delete();
     _file?.delete();
