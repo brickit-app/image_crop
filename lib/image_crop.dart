@@ -10,3 +10,14 @@ import 'package:flutter/services.dart';
 
 part 'src/image_crop.dart';
 part 'src/crop.dart';
+
+/// Thrown when the native plugin rejects [File.path] (e.g. outside app sandbox / path traversal).
+class ImageCropInvalidPathException implements Exception {
+  const ImageCropInvalidPathException(this.message, {this.code = 'INVALID_PATH'});
+
+  final String message;
+  final String code;
+
+  @override
+  String toString() => 'ImageCropInvalidPathException($code): $message';
+}

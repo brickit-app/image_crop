@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -113,21 +114,36 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
     public void onMethodCall(MethodCall call, Result result) {
         if ("cropImage".equals(call.method)) {
             String path = call.argument("path");
+            String safePath = validateAndCanonicalizeReadablePath(path);
+            if (safePath == null) {
+                result.error("INVALID_PATH", "File path must resolve under app-accessible storage", null);
+                return;
+            }
             double scale = call.argument("scale");
             double left = call.argument("left");
             double top = call.argument("top");
             double right = call.argument("right");
             double bottom = call.argument("bottom");
             RectF area = new RectF((float) left, (float) top, (float) right, (float) bottom);
-            cropImage(path, area, (float) scale, result);
+            cropImage(safePath, area, (float) scale, result);
         } else if ("sampleImage".equals(call.method)) {
             String path = call.argument("path");
+            String safePath = validateAndCanonicalizeReadablePath(path);
+            if (safePath == null) {
+                result.error("INVALID_PATH", "File path must resolve under app-accessible storage", null);
+                return;
+            }
             int maximumWidth = call.argument("maximumWidth");
             int maximumHeight = call.argument("maximumHeight");
-            sampleImage(path, maximumWidth, maximumHeight, result);
+            sampleImage(safePath, maximumWidth, maximumHeight, result);
         } else if ("getImageOptions".equals(call.method)) {
             String path = call.argument("path");
-            getImageOptions(path, result);
+            String safePath = validateAndCanonicalizeReadablePath(path);
+            if (safePath == null) {
+                result.error("INVALID_PATH", "File path must resolve under app-accessible storage", null);
+                return;
+            }
+            getImageOptions(safePath, result);
         } else if ("requestPermissions".equals(call.method)) {
             requestPermissions(result);
         } else {
@@ -611,6 +627,10 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
         return false;
     }
 
+    /**
+     * Matches a permission name to its grant result. Must iterate {@code permissions} array length,
+     * never {@code permission.length()} (string length).
+     */
     private int getPermissionGrantResult(String permission, String[] permissions, int[] grantResults) {
         if (permissions == null || grantResults == null) {
             return PackageManager.PERMISSION_DENIED;
@@ -622,6 +642,78 @@ public final class ImageCropPlugin implements FlutterPlugin , ActivityAware, Met
             }
         }
         return PackageManager.PERMISSION_DENIED;
+    }
+
+    /**
+     * Resolves {@code path} canonically and ensures it lies under app-private dirs (mitigates path traversal).
+     *
+     * @return canonical absolute path, or {@code null} if invalid or outside allowed roots
+     */
+    private String validateAndCanonicalizeReadablePath(String path) {
+        Context ctx = activity != null ? activity : applicationContext;
+        if (ctx == null || path == null || path.isEmpty()) {
+            return null;
+        }
+        if (path.indexOf('\0') >= 0) {
+            return null;
+        }
+        try {
+            File canonical = new File(path).getCanonicalFile();
+            String cp = canonical.getPath();
+            List<String> roots = allowedReadablePathRoots(ctx);
+            for (String root : roots) {
+                if (cp.equals(root) || cp.startsWith(root + File.separator)) {
+                    return cp;
+                }
+            }
+        } catch (IOException e) {
+            Log.w("ImageCrop", "Path validation failed", e);
+        }
+        return null;
+    }
+
+    private static List<String> allowedReadablePathRoots(Context ctx) {
+        List<String> out = new ArrayList<>();
+        addCanonicalRoot(out, ctx.getCacheDir());
+        addCanonicalRoot(out, ctx.getFilesDir());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            addCanonicalRoot(out, ctx.getCodeCacheDir());
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            addCanonicalRoot(out, ctx.getDataDir());
+        }
+        addCanonicalRoot(out, ctx.getExternalCacheDir());
+        addCanonicalRoot(out, ctx.getExternalFilesDir(null));
+        File[] extFiles = ctx.getExternalFilesDirs(null);
+        if (extFiles != null) {
+            for (File d : extFiles) {
+                addCanonicalRoot(out, d);
+            }
+        }
+        File[] extCaches = ctx.getExternalCacheDirs();
+        if (extCaches != null) {
+            for (File d : extCaches) {
+                addCanonicalRoot(out, d);
+            }
+        }
+        return out;
+    }
+
+    private static void addCanonicalRoot(List<String> out, File dir) {
+        if (dir == null) {
+            return;
+        }
+        try {
+            String p = dir.getCanonicalPath();
+            for (String existing : out) {
+                if (p.equals(existing)) {
+                    return;
+                }
+            }
+            out.add(p);
+        } catch (IOException e) {
+            Log.w("ImageCrop", "Could not canonicalize directory", e);
+        }
     }
 
     private File createTemporaryImageFile() throws IOException {

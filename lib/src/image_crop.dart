@@ -34,7 +34,15 @@ class ImageCrop {
   static Future<ImageOptions> getImageOptions({
     required File file,
   }) async {
-    final Object? raw = await _channel.invokeMethod<Object?>('getImageOptions', {'path': file.path});
+    final Object? raw;
+    try {
+      raw = await _channel.invokeMethod<Object?>('getImageOptions', {'path': file.path});
+    } on PlatformException catch (e) {
+      if (e.code == 'INVALID_PATH') {
+        throw ImageCropInvalidPathException(e.message ?? 'Invalid file path');
+      }
+      rethrow;
+    }
     if (raw is! Map) {
       throw StateError('Unexpected getImageOptions result: $raw');
     }
@@ -51,14 +59,22 @@ class ImageCrop {
     required Rect area,
     double? scale,
   }) async {
-    final Object? path = await _channel.invokeMethod<Object?>('cropImage', {
-      'path': file.path,
-      'left': area.left,
-      'top': area.top,
-      'right': area.right,
-      'bottom': area.bottom,
-      'scale': scale ?? 1.0,
-    });
+    final Object? path;
+    try {
+      path = await _channel.invokeMethod<Object?>('cropImage', {
+        'path': file.path,
+        'left': area.left,
+        'top': area.top,
+        'right': area.right,
+        'bottom': area.bottom,
+        'scale': scale ?? 1.0,
+      });
+    } on PlatformException catch (e) {
+      if (e.code == 'INVALID_PATH') {
+        throw ImageCropInvalidPathException(e.message ?? 'Invalid file path');
+      }
+      rethrow;
+    }
     if (path is! String) {
       throw StateError('Unexpected cropImage result: $path');
     }
@@ -77,11 +93,19 @@ class ImageCrop {
       );
     }
 
-    final Object? path = await _channel.invokeMethod<Object?>('sampleImage', {
-      'path': file.path,
-      'maximumWidth': preferredSize ?? preferredWidth,
-      'maximumHeight': preferredSize ?? preferredHeight,
-    });
+    final Object? path;
+    try {
+      path = await _channel.invokeMethod<Object?>('sampleImage', {
+        'path': file.path,
+        'maximumWidth': preferredSize ?? preferredWidth,
+        'maximumHeight': preferredSize ?? preferredHeight,
+      });
+    } on PlatformException catch (e) {
+      if (e.code == 'INVALID_PATH') {
+        throw ImageCropInvalidPathException(e.message ?? 'Invalid file path');
+      }
+      rethrow;
+    }
     if (path is! String) {
       throw StateError('Unexpected sampleImage result: $path');
     }

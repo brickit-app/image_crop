@@ -23,6 +23,38 @@ static CGSize ImageCropOrientedPixelSize(CFDictionaryRef properties) {
     return CGSizeMake(dw, dh);
 }
 
+/// Canonical path resolved under the app sandbox (mitigates path traversal via ../ or symlinks).
+static NSString *_Nullable ImageCropValidatedSandboxFilePath(NSString *path, FlutterError *__autoreleasing *outError) {
+    if (path.length == 0) {
+        if (outError) {
+            *outError = [FlutterError errorWithCode:@"INVALID_PATH"
+                                           message:@"Path is empty"
+                                           details:nil];
+        }
+        return nil;
+    }
+    if ([path rangeOfString:@"\0"].location != NSNotFound) {
+        if (outError) {
+            *outError = [FlutterError errorWithCode:@"INVALID_PATH"
+                                           message:@"Path contains invalid characters"
+                                           details:nil];
+        }
+        return nil;
+    }
+    NSString *resolved = [[path stringByResolvingSymlinksInPath] stringByStandardizingPath];
+    NSString *home = [[NSHomeDirectory() stringByResolvingSymlinksInPath] stringByStandardizingPath];
+    NSString *prefix = [home hasSuffix:@"/"] ? home : [home stringByAppendingString:@"/"];
+    if (![resolved isEqualToString:home] && ![resolved hasPrefix:prefix]) {
+        if (outError) {
+            *outError = [FlutterError errorWithCode:@"INVALID_PATH"
+                                           message:@"Path must be under the app sandbox"
+                                           details:nil];
+        }
+        return nil;
+    }
+    return resolved;
+}
+
 @implementation ImageCropPlugin
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
@@ -36,6 +68,14 @@ static CGSize ImageCropOrientedPixelSize(CFDictionaryRef properties) {
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     if ([@"cropImage" isEqualToString:call.method]) {
         NSString* path = (NSString*)call.arguments[@"path"];
+        FlutterError *pathError = nil;
+        NSString *safePath = ImageCropValidatedSandboxFilePath(path, &pathError);
+        if (!safePath) {
+            result(pathError ?: [FlutterError errorWithCode:@"INVALID_PATH"
+                                                    message:@"Invalid file path"
+                                                    details:nil]);
+            return;
+        }
         NSNumber* left = (NSNumber*)call.arguments[@"left"];
         NSNumber* top = (NSNumber*)call.arguments[@"top"];
         NSNumber* right = (NSNumber*)call.arguments[@"right"];
@@ -44,18 +84,34 @@ static CGSize ImageCropOrientedPixelSize(CFDictionaryRef properties) {
         CGRect area = CGRectMake(left.floatValue, top.floatValue,
                                  right.floatValue - left.floatValue,
                                  bottom.floatValue - top.floatValue);
-        [self cropImage:path area:area scale:scale result:result];
+        [self cropImage:safePath area:area scale:scale result:result];
     } else if ([@"sampleImage" isEqualToString:call.method]) {
         NSString* path = (NSString*)call.arguments[@"path"];
+        FlutterError *pathError = nil;
+        NSString *safePath = ImageCropValidatedSandboxFilePath(path, &pathError);
+        if (!safePath) {
+            result(pathError ?: [FlutterError errorWithCode:@"INVALID_PATH"
+                                                    message:@"Invalid file path"
+                                                    details:nil]);
+            return;
+        }
         NSNumber* maximumWidth = (NSNumber*)call.arguments[@"maximumWidth"];
         NSNumber* maximumHeight = (NSNumber*)call.arguments[@"maximumHeight"];
-        [self sampleImage:path
+        [self sampleImage:safePath
              maximumWidth:maximumWidth
             maximumHeight:maximumHeight
                    result:result];
     } else if ([@"getImageOptions" isEqualToString:call.method]) {
         NSString* path = (NSString*)call.arguments[@"path"];
-        [self getImageOptions:path result:result];
+        FlutterError *pathError = nil;
+        NSString *safePath = ImageCropValidatedSandboxFilePath(path, &pathError);
+        if (!safePath) {
+            result(pathError ?: [FlutterError errorWithCode:@"INVALID_PATH"
+                                                    message:@"Invalid file path"
+                                                    details:nil]);
+            return;
+        }
+        [self getImageOptions:safePath result:result];
     } else if ([@"requestPermissions" isEqualToString:call.method]){
         [self requestPermissionsWithResult:result];
     } else {
